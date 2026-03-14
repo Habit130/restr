@@ -6,7 +6,8 @@ channels:
 dependencies:
   - python=3.10
   - pip
-  - numpy
+  - numpy=1.26.4
+  - mkl<2024.1
   - scipy
   - pillow
   - pyyaml

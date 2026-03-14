@@ -13,6 +13,13 @@ This repository is prepared for Linux server execution with a single RTX 4090.
 
 Create the server environment from `environment.server.yml`.
 
+If you already created the environment before this pin was added, downgrade NumPy once:
+
+```bash
+conda activate restr-server
+conda install -y -c conda-forge "numpy<2" "mkl<2024.1" "intel-openmp<2024.1"
+```
+
 ## Dataset preparation
 
 Generate custom ReSTR batches, vocabulary, and embeddings from the sibling dataset:
