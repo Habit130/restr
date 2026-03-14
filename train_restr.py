@@ -42,6 +42,18 @@ WEIGHT_DECAY = 0.0005
 EXPERIMENT_NAME = 'restr'
 LOG_EVERY = 100
 
+
+def infer_dataset_name(data_dir):
+    return osp.basename(osp.normpath(data_dir)).split("_")[0]
+
+
+def infer_data_root(data_dir):
+    return osp.dirname(osp.normpath(data_dir))
+
+
+def checkpoint_path(snapshot_dir, dataset_name, step):
+    return osp.join(snapshot_dir, dataset_name + "_" + str(step) + ".pth")
+
 def get_arguments():
     """Parse all the arguments provided from the CLI.
     
@@ -79,6 +91,7 @@ def get_arguments():
     parser.add_argument("--no_decoder", action="store_true")
 
     parser.add_argument("--is_vis", action="store_true")
+    parser.add_argument("--no_val", action="store_true")
     parser.add_argument("--exp_name", type=str, default=EXPERIMENT_NAME)
     parser.add_argument("--save_every", type=int, default=SAVE_PRED_EVERY)
     parser.add_argument("--log_every", type=int, default=LOG_EVERY)
@@ -106,6 +119,7 @@ def make_model_cfg(args, cfg, input_size, dataset_name):
     l_model_cfg["n_heads"] = v_model_cfg["n_heads"]
     l_model_cfg["emb_name"] = dataset_name
     l_model_cfg["d_model"] = v_model_cfg["d_model"]
+    l_model_cfg["data_root"] = infer_data_root(args.data_dir)
     model_cfg["l_backbone"] = l_model_cfg
 
     fusion_module = args.mm_fusion
@@ -122,7 +136,7 @@ def make_model_cfg(args, cfg, input_size, dataset_name):
 def main():
     """Create the model and start the training."""
     
-    dataset_name = ((args.data_dir).split("/")[-1]).split("_")[0]
+    dataset_name = infer_dataset_name(args.data_dir)
     print("Training dataset: {} | In {} of threads".format(dataset_name, torch.get_num_threads()))
     print("<Argument check>\n", vars(args))
 
@@ -150,20 +164,24 @@ def main():
     print("# of parameters: ", num_model)
 
     snapshot_dir = osp.join('./weights', args.exp_name)
-    eval_dir = osp.join('./eval_dir_val', args.exp_name)
     if not os.path.exists(snapshot_dir):
         os.makedirs(snapshot_dir)
-    if not os.path.exists(eval_dir):
-        os.makedirs(eval_dir)
+    eval_dir = None
+    if not args.no_val:
+        eval_dir = osp.join('./eval_dir_val', args.exp_name)
+        if not os.path.exists(eval_dir):
+            os.makedirs(eval_dir)
 
     ## Call dataloader {Gref, unc, unc+, referit}
     trainloader = data.DataLoader(ReferDataSet_vit(args.data_dir, args.set, max_iters=args.num_steps * args.batch_size), 
                     batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
     trainloader_iter = enumerate(trainloader)
 
-    val_max_iters = 10000 if dataset_name == 'referit' else None
-    valloader = data.DataLoader(ReferDataSet_vit(args.data_dir, args.valset, max_iters=val_max_iters), 
-                            batch_size=1, shuffle=False, num_workers=1)
+    valloader = None
+    if not args.no_val:
+        val_max_iters = 10000 if dataset_name == 'referit' else None
+        valloader = data.DataLoader(ReferDataSet_vit(args.data_dir, args.valset, max_iters=val_max_iters), 
+                                batch_size=1, shuffle=False, num_workers=1)
 
     ## Define Optimizer 
     optimizer = optim.AdamW(model.optim_parameters(args)
@@ -233,8 +251,11 @@ def main():
             losses['pixel'].reset()
             losses['patch'].reset()
 
+        if args.no_val and ((i_iter % args.save_every == 0) or (i_iter == args.num_steps)):
+            torch.save(model.state_dict(), checkpoint_path(snapshot_dir, dataset_name, i_iter))
+
         #Snapshot
-        if (i_iter == 1) or (i_iter % args.save_every == 0):
+        if (not args.no_val) and ((i_iter == 1) or (i_iter % args.save_every == 0)):
             model.eval()
             output_eval_dir = os.path.join(eval_dir, str(i_iter))
             cum_IoU = evaluate(output_eval_dir, i_iter, model, valloader=valloader, H=input_size[0], W=input_size[1]
@@ -247,9 +268,12 @@ def main():
                 best_IoU = 0
             if cum_IoU > best_IoU:
                 best_IoU = cum_IoU 
-                torch.save(model.state_dict(),osp.join(snapshot_dir, dataset_name + "_" + str(i_iter) + '.pth')) if i_iter > 10000 else None  
+                torch.save(model.state_dict(), checkpoint_path(snapshot_dir, dataset_name, i_iter)) if i_iter > 10000 else None  
             elif i_iter > args.num_steps * 0.9:
-                torch.save(model.state_dict(),osp.join(snapshot_dir, dataset_name + "_" + str(i_iter) + '.pth')) if i_iter > 10000 else None 
+                torch.save(model.state_dict(), checkpoint_path(snapshot_dir, dataset_name, i_iter)) if i_iter > 10000 else None 
+
+            if i_iter == args.num_steps:
+                torch.save(model.state_dict(), checkpoint_path(snapshot_dir, dataset_name, i_iter))
 
     end = timeit.default_timer()
     print(end-start,'seconds')

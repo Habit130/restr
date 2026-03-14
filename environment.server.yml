@@ -1,0 +1,29 @@
+name: restr-server
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - pillow
+  - pyyaml
+  - scikit-image
+  - matplotlib
+  - tqdm
+  - cython
+  - pytorch=2.5
+  - torchvision=0.20
+  - pytorch-cuda=12.1
+  - pip:
+      - einops==0.5.0
+      - ftfy==6.1.1
+      - opencv-python==4.10.0.84
+      - pycocotools==2.0.7
+      - regex==2022.9.13
+      - sentencepiece==0.1.97
+      - timm==0.6.11
+      - transformers==4.22.2
+      - wandb==0.13.4

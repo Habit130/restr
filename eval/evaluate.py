@@ -1,6 +1,7 @@
 import sys
 sys.path.append('../')
 from eval.visualization import save_img_gt, save_mask_soft_torch, save_mask_softpatch_torch, save_mask_torch
+import json
 import os
 import os.path as osp
 import argparse
@@ -21,6 +22,7 @@ import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import config
 from model.factory import create_restr
+from utils.binary_metrics import BinarySegMeter
 
 
 STATS = {
@@ -39,15 +41,41 @@ IGNORE_LABEL = 255
 THRESHOLD = 1e-9
 
 
+def infer_dataset_name(data_dir):
+    return osp.basename(osp.normpath(data_dir)).split("_")[0]
+
+
+def infer_data_root(data_dir):
+    return osp.dirname(osp.normpath(data_dir))
+
+
+def resolve_checkpoint_path(restore_refseg, dataset_name, i_iter, checkpoint_prefix=None):
+    prefixes = []
+    if checkpoint_prefix:
+        prefixes.append(checkpoint_prefix)
+    if dataset_name not in prefixes:
+        prefixes.append(dataset_name)
+    restore_name = osp.basename(osp.normpath(restore_refseg))
+    if restore_name not in prefixes:
+        prefixes.append(restore_name)
+
+    for prefix in prefixes:
+        candidate = osp.join(restore_refseg, prefix + "_" + str(i_iter) + ".pth")
+        if osp.exists(candidate):
+            return candidate
+
+    return osp.join(restore_refseg, prefixes[0] + "_" + str(i_iter) + ".pth")
+
+
 def evaluate(output_eval_dir, i_iter, model
             , H = 320, W =320, valloader=None, is_vis = False, save_im_sent = False
-            , threshold=1e-8, is_prec=False, dataname = None):
-    if not os.path.exists(output_eval_dir):
-        os.makedirs(output_eval_dir+'/img')
-        os.makedirs(output_eval_dir+'/gt')
-        os.makedirs(output_eval_dir+'/pred_sigm')
-        os.makedirs(output_eval_dir+'/pred_h')
-        os.makedirs(output_eval_dir+'/pred_cmap')
+            , threshold=1e-8, is_prec=False, dataname = None, binary_metrics=False
+            , metrics_output_path=None):
+    os.makedirs(output_eval_dir+'/img', exist_ok=True)
+    os.makedirs(output_eval_dir+'/gt', exist_ok=True)
+    os.makedirs(output_eval_dir+'/pred_sigm', exist_ok=True)
+    os.makedirs(output_eval_dir+'/pred_h', exist_ok=True)
+    os.makedirs(output_eval_dir+'/pred_cmap', exist_ok=True)
 
 
     model.eval()
@@ -58,6 +86,7 @@ def evaluate(output_eval_dir, i_iter, model
         eval_seg_iou_list = [.5, .6, .7, .8, .9]
         seg_correct = np.zeros(len(eval_seg_iou_list), dtype=np.int32)
         seg_total = 0.
+    binary_meter = BinarySegMeter() if binary_metrics else None
     with torch.no_grad():
         t= tqdm(valloader, desc='Evaluating', leave=True)
         for index, batch in enumerate(t):
@@ -95,12 +124,17 @@ def evaluate(output_eval_dir, i_iter, model
                 I, U = compute_mask_IU_torch(hard_pred, labels)
             except:
                 print(name)
+            I = I.item()
+            U = U.item()
             cum_I += I
             cum_U += U
+            if binary_meter is not None:
+                binary_meter.update(hard_pred, labels)
+            sample_iou = (I / U) if U > 0 else 1.0
             if is_prec is True:
                 for n_eval_iou in range(len(eval_seg_iou_list)):
                     eval_seg_iou = eval_seg_iou_list[n_eval_iou]
-                    seg_correct[n_eval_iou] += (I / U >= eval_seg_iou)
+                    seg_correct[n_eval_iou] += (sample_iou >= eval_seg_iou)
                 seg_total += 1
 
             if is_vis and index < 400:
@@ -119,12 +153,14 @@ def evaluate(output_eval_dir, i_iter, model
                         sent = "_".join(sents[i].split(" ")).replace("/", "_")
                         save_img_gt(orig_images, labels[i].cpu().data.numpy().squeeze(), name[i], sent, output_eval_dir)
 
-            t.set_postfix({"mIoU ":" %.3f%% " % (100*(cum_I/cum_U))})  
+            if cum_U > 0:
+                t.set_postfix({"mIoU ":" %.3f%% " % (100*(cum_I/cum_U))})  
             
-            if i_iter == 1:
+            if i_iter == 1 and dataname is None:
                 t.close()
                 break
 
+        metrics = {}
         if is_prec is True:
             result_str = ''
             for n_eval_iou in range(len(eval_seg_iou_list)):
@@ -132,8 +168,33 @@ def evaluate(output_eval_dir, i_iter, model
                             (str(eval_seg_iou_list[n_eval_iou]), seg_correct[n_eval_iou] / seg_total)
             print(result_str)
             print("Cumulated_IoU = %.3f" %(100*(cum_I/cum_U)))
-        cum_IoU = 100*(cum_I/cum_U)
+            metrics["precision_at"] = {
+                str(eval_seg_iou_list[n_eval_iou]): float(seg_correct[n_eval_iou] / seg_total)
+                for n_eval_iou in range(len(eval_seg_iou_list))
+            }
+        cum_IoU = 100*(cum_I/cum_U) if cum_U > 0 else 0.0
+        metrics["cum_IoU"] = float(cum_IoU)
 
+        if binary_meter is not None:
+            binary_summary = binary_meter.compute()
+            metrics.update(binary_summary)
+            print(
+                "IoU = {iou:.4f} | Dice = {dice:.4f} | Recall = {recall:.4f} | "
+                "mIoU = {miou:.4f} | mAcc = {macc:.4f}".format(
+                    iou=binary_summary["IoU"],
+                    dice=binary_summary["Dice"],
+                    recall=binary_summary["Recall"],
+                    miou=binary_summary["mIoU"],
+                    macc=binary_summary["mAcc"],
+                )
+            )
+
+        if metrics_output_path is not None:
+            with open(metrics_output_path, "w", encoding="utf-8") as f:
+                json.dump(metrics, f, indent=2, sort_keys=True)
+
+        if binary_metrics:
+            return metrics
         return cum_IoU
 
 
@@ -152,6 +213,8 @@ def get_arguments():
     parser.add_argument("--threshold", type=float, default=THRESHOLD)
     parser.add_argument("--restore_refseg", type=str, required=True)
     parser.add_argument('--iters', type=int, nargs='*', required=True)
+    parser.add_argument("--checkpoint_prefix", type=str, default=None)
+    parser.add_argument("--binary_metrics", action="store_true")
 
     parser.add_argument("--v_backbone", type=str, default="vit_base_patch16_384")
     parser.add_argument("--l_backbone", type=str, default="transformer_glove")
@@ -186,9 +249,7 @@ def make_model_cfg(args, cfg, input_size, dataset_name):
     l_model_cfg["n_heads"] = v_model_cfg["n_heads"]
     l_model_cfg["emb_name"] = dataset_name
     l_model_cfg["d_model"] = v_model_cfg["d_model"]
-    data_root = args.data_dir.split("/")[:-2]
-    data_root = '/'.join(data_root)
-    l_model_cfg["data_root"] = data_root
+    l_model_cfg["data_root"] = infer_data_root(args.data_dir)
     model_cfg["l_backbone"] = l_model_cfg
 
     fusion_module = args.mm_fusion
@@ -216,23 +277,23 @@ def main():
         del (args.iters)[0]
 
     print(str(args.iters) + ' will be evaluated!')
-    output_dir = osp.basename(args.restore_refseg) if args.output_dir is None else args.output_dir
+    output_dir = osp.basename(osp.normpath(args.restore_refseg)) if args.output_dir is None else args.output_dir
     
 
 
-    dataset_name = ((args.data_dir).split("/")[-1]).split("_")[0]
+    dataset_name = infer_dataset_name(args.data_dir)
     print("Training dataset: {}".format(dataset_name))
-    print(args.restore_refseg+"/"+osp.basename(args.restore_refseg)+ "_" +str(args.iters)+".pth")
+    print(resolve_checkpoint_path(args.restore_refseg, dataset_name, args.iters[0], args.checkpoint_prefix))
 
     # Create network.
     cfg = config.load_config()
     model_cfg = make_model_cfg(args, cfg, input_size, dataset_name)
 
     model = create_restr(model_cfg)
+    output_root = os.path.join("../eval_dir/", output_dir, args.set)
         
     for i_iter in args.iters:
-
-        weight_path_vis = args.restore_refseg+"/"+osp.basename(args.restore_refseg)+"_"+str(i_iter)+".pth"
+        weight_path_vis = resolve_checkpoint_path(args.restore_refseg, dataset_name, i_iter, args.checkpoint_prefix)
         saved_state_dict_vis = torch.load(weight_path_vis)
 
 
@@ -245,10 +306,11 @@ def main():
         valloader = data.DataLoader(ReferDataSet_vit(args.data_dir, args.set), 
                             batch_size=1, shuffle=False, num_workers=1, pin_memory=True)
 
-        output_dir = output_dir + '/' + args.set
-        output_eval_dir = os.path.join("../eval_dir/", output_dir, str(i_iter))
+        output_eval_dir = os.path.join(output_root, str(i_iter))
         evaluate(output_eval_dir, i_iter, model, valloader=valloader, H=input_size[0], W=input_size[1]
-            , is_vis=args.is_vis, save_im_sent = True, threshold=args.threshold, is_prec=True, dataname = dataset_name)
+            , is_vis=args.is_vis, save_im_sent = True, threshold=args.threshold, is_prec=not args.binary_metrics
+            , dataname = dataset_name, binary_metrics=args.binary_metrics
+            , metrics_output_path=os.path.join(output_eval_dir, "metrics.json"))
 
 
 if __name__ == '__main__':

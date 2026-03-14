@@ -7,11 +7,35 @@ import numpy as np
 from utils.torchutils import init_He
 import pdb
 import os.path as osp
+from pathlib import Path
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from timm.models.layers import trunc_normal_
 from model.transformers.utils import init_weights, positionalencoding1d, positionalencoding2d
 from model.transformers.blocks import LangBlock
 affine_par = True     
+
+
+def resolve_embedding_path(data_root, emb_name):
+    data_root = Path(data_root)
+    candidates = [data_root / (emb_name + "_emb.npy")]
+    legacy_names = {
+        "referit": "referit_emb.npy",
+        "Gref": "Gref_emb.npy",
+        "unc": "Gref_emb.npy",
+        "unc+": "Gref_emb.npy",
+    }
+    if emb_name in legacy_names:
+        candidates.append(data_root / legacy_names[emb_name])
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "Embedding matrix not found for '{}'. Checked: {}".format(
+            emb_name, ", ".join(str(candidate) for candidate in candidates)
+        )
+    )
 
 class TR_GloVe(nn.Module):
     # (batch_size, n, ) torch already know, you don't need to let torch know
@@ -30,14 +54,15 @@ class TR_GloVe(nn.Module):
         
         self.d_model = d_model
         # GloVe embedding
-        glove_np = np.load(osp.join(data_root,'referit_emb.npy')) if emb_name == 'referit' else np.load(osp.join(data_root,'Gref_emb.npy'))
-        print("Loaded embedding npy at data/{}_emb.npy".format('referit' if emb_name == 'referit' else 'Gref'))
+        embedding_path = resolve_embedding_path(data_root, emb_name)
+        glove_np = np.load(embedding_path)
+        print("Loaded embedding npy at {}".format(embedding_path))
         self.glove = torch.from_numpy(glove_np)  # [vocab_size, 300]
         self.embedding = nn.Embedding.from_pretrained(self.glove, padding_idx=0, freeze=False)
         self.embedding.weight[0].data.zero_()
 
         # Positional embedding for TR
-        self.pos_emb_l = positionalencoding1d(d_lang, 20).unsqueeze(0).cuda()
+        self.register_buffer("pos_emb_l", positionalencoding1d(d_lang, 20).unsqueeze(0), persistent=False)
 
         # TR
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, n_layers)]
@@ -54,7 +79,7 @@ class TR_GloVe(nn.Module):
     def forward(self, x):
         x = self.embedding(x) # y.shape = [B, C, 1, 1]
 
-        pos_emb_l = self.pos_emb_l
+        pos_emb_l = self.pos_emb_l.to(x.device)
         x += pos_emb_l
         for blk in self.blocks:
             x = blk(x)

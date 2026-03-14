@@ -50,8 +50,7 @@ class ReferDataSet_vit(data.Dataset):
 
         datafiles = np.load(self.data_list[index])
 
-        name = self.data_list[index].split('/')[-1]
-        name = name.split('.')[0]
+        name = osp.splitext(osp.basename(self.data_list[index]))[0]
 
         # pdb.set_trace()
         image = Image.fromarray(datafiles["im_batch"]).convert('RGB')

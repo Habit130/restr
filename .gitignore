@@ -22,8 +22,12 @@ __pycache__/
 data/coco
 data/mscoco
 data/referit
+data/plantseg_480_batch/
+data/plantseg_emb.npy
+data/vocabulary_plantseg.txt
 visualization/
 wandb/
 weights/
 external/refer/data/
 eval_dir/
+eval_dir_val/
