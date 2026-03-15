@@ -122,10 +122,20 @@ def evaluate(output_eval_dir, i_iter, model
             hard_pred = (pred >= threshold)
             try:
                 I, U = compute_mask_IU_torch(hard_pred, labels)
-            except:
-                print(name)
-            I = I.item()
-            U = U.item()
+                I = int(I.item())
+                U = int(U.item())
+            except Exception as exc:
+                pred_np = hard_pred.detach().cpu().numpy().astype(bool)
+                label_np = labels.detach().cpu().numpy().astype(bool)
+                if pred_np.shape != label_np.shape:
+                    raise RuntimeError(
+                        "Failed to compute IoU for sample {} with pred shape {} and label shape {}".format(
+                            name, pred_np.shape, label_np.shape
+                        )
+                    ) from exc
+                print("Falling back to numpy IoU for sample {}".format(name))
+                I = int(np.logical_and(pred_np, label_np).sum())
+                U = int(np.logical_or(pred_np, label_np).sum())
             cum_I += I
             cum_U += U
             if binary_meter is not None:
