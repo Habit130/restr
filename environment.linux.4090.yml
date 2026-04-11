@@ -1,0 +1,29 @@
+name: restr-4090
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.1.*
+  - torchvision=0.16.*
+  - torchaudio=2.1.*
+  - pytorch-cuda=11.8
+  - numpy=1.26.*
+  - scipy=1.11.*
+  - pillow=10.*
+  - pyyaml=6.*
+  - tqdm=4.*
+  - matplotlib=3.8.*
+  - scikit-image=0.22.*
+  - opencv=4.9.*
+  - cython=3.0.*
+  - pip
+  - pip:
+      - einops==0.7.0
+      - ftfy==6.2.0
+      - pycocotools==2.0.7
+      - sentencepiece==0.2.0
+      - timm==0.6.11
+      - transformers==4.22.2
+      - wandb==0.17.9

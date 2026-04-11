@@ -4,6 +4,8 @@ from eval.visualization import save_img_gt, save_mask_soft_torch, save_mask_soft
 import os
 import os.path as osp
 import argparse
+import json
+from pathlib import Path
 from torch.utils import data
 from dataset.referit_dataset_vit import ReferDataSet_vit
 
@@ -13,14 +15,11 @@ from torch.autograd import Variable
 import os
 from PIL import Image
 from tqdm import tqdm
-import torch.nn.functional as F
-import torchvision.transforms.functional as TF
-from utils.torchutils import compute_mask_IU, compute_mask_IU_torch, decode_image_vit, resize_and_crop_nearest, resize_and_pad, resize_and_crop, vis_torch_mask
-from utils.imutils import crf_inference_label
-import torch.nn as nn
+from utils.torchutils import decode_image_vit, resize_and_crop_nearest, resize_and_pad, resize_and_crop
 import torch.backends.cudnn as cudnn
 import config
 from model.factory import create_restr
+from utils.text_assets import get_dataset_text_spec
 
 
 STATS = {
@@ -36,12 +35,55 @@ BATCH_SIZE = 8
 DROPOUT = 0
 DROP_PATH = 0.1
 IGNORE_LABEL = 255
-THRESHOLD = 1e-9
+THRESHOLD = 0.5
+
+
+def infer_dataset_name(data_dir):
+    return Path(data_dir).name.split("_")[0]
+
+
+def infer_data_root(data_dir):
+    return str(Path(data_dir).resolve().parent.parent)
+
+
+def resolve_text_len(dataset_name, override=None):
+    if override is not None:
+        return override
+    return get_dataset_text_spec(dataset_name)["text_len"]
+
+
+def update_confusion_counts(pred_mask, target_mask):
+    pred_mask = pred_mask.bool()
+    target_mask = target_mask.bool()
+    tp = torch.logical_and(pred_mask, target_mask).sum().item()
+    fp = torch.logical_and(pred_mask, torch.logical_not(target_mask)).sum().item()
+    fn = torch.logical_and(torch.logical_not(pred_mask), target_mask).sum().item()
+    tn = torch.logical_and(torch.logical_not(pred_mask), torch.logical_not(target_mask)).sum().item()
+    return tp, fp, fn, tn
+
+
+def safe_ratio(numerator, denominator):
+    return 0.0 if denominator == 0 else numerator / denominator
+
+
+def summarize_binary_metrics(tp, fp, fn, tn):
+    fg_iou = safe_ratio(tp, tp + fp + fn)
+    bg_iou = safe_ratio(tn, tn + fp + fn)
+    fg_acc = safe_ratio(tp, tp + fn)
+    bg_acc = safe_ratio(tn, tn + fp)
+    metrics = {
+        "IoU": 100.0 * fg_iou,
+        "Dice": 100.0 * safe_ratio(2 * tp, 2 * tp + fp + fn),
+        "Recall": 100.0 * fg_acc,
+        "mIoU": 100.0 * ((fg_iou + bg_iou) / 2.0),
+        "mACC": 100.0 * ((fg_acc + bg_acc) / 2.0),
+    }
+    return metrics
 
 
 def evaluate(output_eval_dir, i_iter, model
             , H = 320, W =320, valloader=None, is_vis = False, save_im_sent = False
-            , threshold=1e-8, is_prec=False, dataname = None):
+            , threshold=THRESHOLD, is_prec=False, dataname = None):
     if not os.path.exists(output_eval_dir):
         os.makedirs(output_eval_dir+'/img')
         os.makedirs(output_eval_dir+'/gt')
@@ -51,9 +93,7 @@ def evaluate(output_eval_dir, i_iter, model
 
 
     model.eval()
-    cum_I, cum_U = 0., 0.
-    cum_I_sigm, cum_U_sigm = 0., 0.
-    cum_I_crf, cum_U_crf = 0., 0.
+    tp_sum, fp_sum, fn_sum, tn_sum = 0, 0, 0, 0
     if is_prec is True:
         eval_seg_iou_list = [.5, .6, .7, .8, .9]
         seg_correct = np.zeros(len(eval_seg_iou_list), dtype=np.int32)
@@ -85,22 +125,20 @@ def evaluate(output_eval_dir, i_iter, model
             
             pred = resize_and_crop(pred, orig_H, orig_W)
             sigm_pred = resize_and_crop(sigm_pred, orig_H, orig_W)
-            
-            labels_np = labels.cpu().data.numpy()
 
             orig_images = decode_image_vit(orig_images[0], normalization=STATS['vit'])
 
-            hard_pred = (pred >= threshold)
-            try:
-                I, U = compute_mask_IU_torch(hard_pred, labels)
-            except:
-                print(name)
-            cum_I += I
-            cum_U += U
+            hard_pred = (sigm_pred >= threshold) if 0.0 <= threshold <= 1.0 else (pred >= threshold)
+            batch_tp, batch_fp, batch_fn, batch_tn = update_confusion_counts(hard_pred, labels)
+            tp_sum += batch_tp
+            fp_sum += batch_fp
+            fn_sum += batch_fn
+            tn_sum += batch_tn
+            batch_iou = safe_ratio(batch_tp, batch_tp + batch_fp + batch_fn)
             if is_prec is True:
                 for n_eval_iou in range(len(eval_seg_iou_list)):
                     eval_seg_iou = eval_seg_iou_list[n_eval_iou]
-                    seg_correct[n_eval_iou] += (I / U >= eval_seg_iou)
+                    seg_correct[n_eval_iou] += (batch_iou >= eval_seg_iou)
                 seg_total += 1
 
             if is_vis and index < 400:
@@ -119,7 +157,8 @@ def evaluate(output_eval_dir, i_iter, model
                         sent = "_".join(sents[i].split(" ")).replace("/", "_")
                         save_img_gt(orig_images, labels[i].cpu().data.numpy().squeeze(), name[i], sent, output_eval_dir)
 
-            t.set_postfix({"mIoU ":" %.3f%% " % (100*(cum_I/cum_U))})  
+            running_metrics = summarize_binary_metrics(tp_sum, fp_sum, fn_sum, tn_sum)
+            t.set_postfix({"IoU ": " %.3f%% " % running_metrics["IoU"]})  
             
             if i_iter == 1:
                 t.close()
@@ -131,10 +170,15 @@ def evaluate(output_eval_dir, i_iter, model
                 result_str += 'Prec@%s = %f | \t' % \
                             (str(eval_seg_iou_list[n_eval_iou]), seg_correct[n_eval_iou] / seg_total)
             print(result_str)
-            print("Cumulated_IoU = %.3f" %(100*(cum_I/cum_U)))
-        cum_IoU = 100*(cum_I/cum_U)
-
-        return cum_IoU
+        metrics = summarize_binary_metrics(tp_sum, fp_sum, fn_sum, tn_sum)
+        print(
+            "IoU={IoU:.3f} Dice={Dice:.3f} Recall={Recall:.3f} mIoU={mIoU:.3f} mACC={mACC:.3f}".format(
+                **metrics
+            )
+        )
+        with open(os.path.join(output_eval_dir, "metrics.json"), "w", encoding="utf-8") as handle:
+            json.dump(metrics, handle, indent=2)
+        return metrics
 
 
 def get_arguments():
@@ -150,8 +194,10 @@ def get_arguments():
 
     parser.add_argument("--input-size", type=str, default=INPUT_SIZE)
     parser.add_argument("--threshold", type=float, default=THRESHOLD)
-    parser.add_argument("--restore_refseg", type=str, required=True)
-    parser.add_argument('--iters', type=int, nargs='*', required=True)
+    parser.add_argument("--restore_refseg", type=str, default=None)
+    parser.add_argument('--iters', type=int, nargs='*', default=None)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--text_len", type=int, default=None)
 
     parser.add_argument("--v_backbone", type=str, default="vit_base_patch16_384")
     parser.add_argument("--l_backbone", type=str, default="transformer_glove")
@@ -175,24 +221,22 @@ def make_model_cfg(args, cfg, input_size, dataset_name):
 
     model_cfg = {}
     v_backbone = args.v_backbone
-    v_model_cfg = cfg["v_backbone"][v_backbone]
+    v_model_cfg = cfg["v_backbone"][v_backbone].copy()
     v_model_cfg["image_size"] = input_size
     v_model_cfg["backbone"] = v_backbone
     model_cfg["v_backbone"] = v_model_cfg
     
     l_backbone = args.l_backbone
-    l_model_cfg = cfg["l_backbone"][l_backbone]
-    # l_model_cfg["backbone"] = l_backbone
+    l_model_cfg = cfg["l_backbone"][l_backbone].copy()
     l_model_cfg["n_heads"] = v_model_cfg["n_heads"]
     l_model_cfg["emb_name"] = dataset_name
     l_model_cfg["d_model"] = v_model_cfg["d_model"]
-    data_root = args.data_dir.split("/")[:-2]
-    data_root = '/'.join(data_root)
-    l_model_cfg["data_root"] = data_root
+    l_model_cfg["data_root"] = infer_data_root(args.data_dir)
+    l_model_cfg["text_len"] = resolve_text_len(dataset_name, args.text_len)
     model_cfg["l_backbone"] = l_model_cfg
 
     fusion_module = args.mm_fusion
-    mm_fusion_cfg = cfg["fusion_module"]
+    mm_fusion_cfg = cfg["fusion_module"].copy()
     mm_fusion_cfg["name"] = fusion_module
     mm_fusion_cfg["is_shared"] =args.is_shared
     mm_fusion_cfg["is_decoder"] = not args.no_decoder
@@ -210,32 +254,41 @@ def main():
     cudnn.enabled = True
     cudnn.benchmark = True
 
-    if len(args.iters) == 1 and args.iters[0] == 0:
+    if args.checkpoint is None and args.restore_refseg is None:
+        raise ValueError("Either --checkpoint or --restore_refseg must be provided.")
+    if args.checkpoint is None and not args.iters:
+        raise ValueError("--iters is required when --restore_refseg is used.")
+    if args.checkpoint is None and len(args.iters) == 1 and args.iters[0] == 0:
         for i in range(50):
-            (args.iters).append((i+1)*5000)
-        del (args.iters)[0]
+            args.iters.append((i + 1) * 5000)
+        del args.iters[0]
 
-    print(str(args.iters) + ' will be evaluated!')
-    output_dir = osp.basename(args.restore_refseg) if args.output_dir is None else args.output_dir
-    
-
-
-    dataset_name = ((args.data_dir).split("/")[-1]).split("_")[0]
+    dataset_name = infer_dataset_name(args.data_dir)
     print("Training dataset: {}".format(dataset_name))
-    print(args.restore_refseg+"/"+osp.basename(args.restore_refseg)+ "_" +str(args.iters)+".pth")
+    output_dir = osp.basename(args.restore_refseg) if args.output_dir is None and args.restore_refseg else dataset_name
+    if args.output_dir is not None:
+        output_dir = args.output_dir
 
     # Create network.
     cfg = config.load_config()
     model_cfg = make_model_cfg(args, cfg, input_size, dataset_name)
 
     model = create_restr(model_cfg)
-        
-    for i_iter in args.iters:
+    checkpoint_entries = []
+    if args.checkpoint is not None:
+        checkpoint_entries.append(("best", args.checkpoint))
+    else:
+        print(str(args.iters) + ' will be evaluated!')
+        for i_iter in args.iters:
+            weight_path_vis = args.restore_refseg+"/"+osp.basename(args.restore_refseg)+"_"+str(i_iter)+".pth"
+            checkpoint_entries.append((str(i_iter), weight_path_vis))
 
-        weight_path_vis = args.restore_refseg+"/"+osp.basename(args.restore_refseg)+"_"+str(i_iter)+".pth"
-        saved_state_dict_vis = torch.load(weight_path_vis)
+    output_root = Path("../eval_dir") / output_dir / args.set
+    output_root.mkdir(parents=True, exist_ok=True)
+    summary = {}
 
-
+    for i_iter, checkpoint_path in checkpoint_entries:
+        saved_state_dict_vis = torch.load(checkpoint_path, map_location="cpu")
         model.load_state_dict(saved_state_dict_vis)
         model.eval()
         model.cuda()
@@ -245,10 +298,13 @@ def main():
         valloader = data.DataLoader(ReferDataSet_vit(args.data_dir, args.set), 
                             batch_size=1, shuffle=False, num_workers=1, pin_memory=True)
 
-        output_dir = output_dir + '/' + args.set
-        output_eval_dir = os.path.join("../eval_dir/", output_dir, str(i_iter))
-        evaluate(output_eval_dir, i_iter, model, valloader=valloader, H=input_size[0], W=input_size[1]
+        output_eval_dir = str(output_root / str(i_iter))
+        metrics = evaluate(output_eval_dir, i_iter, model, valloader=valloader, H=input_size[0], W=input_size[1]
             , is_vis=args.is_vis, save_im_sent = True, threshold=args.threshold, is_prec=True, dataname = dataset_name)
+        summary[str(i_iter)] = {"checkpoint": checkpoint_path, "metrics": metrics}
+
+    with open(output_root / "summary_metrics.json", "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
 
 
 if __name__ == '__main__':

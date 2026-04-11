@@ -10,12 +10,15 @@ def load_vocab_dict_from_file(dict_file):
 
 UNK_IDENTIFIER = '<unk>' # <unk> is the word used to identify unknown words
 SENTENCE_SPLIT_REGEX = re.compile(r'(\W+)')
-def sentence2vocab_indices(sentence, vocab_dict):
+def tokenize_sentence(sentence):
     words = SENTENCE_SPLIT_REGEX.split(sentence.strip())
-    words = [w.lower() for w in words if len(w.strip()) > 0]
-    # remove .
-    if words[-1] == '.':
+    words = [w.strip().lower() for w in words if len(w.strip()) > 0]
+    if words and words[-1] == '.':
         words = words[:-1]
+    return words
+
+def sentence2vocab_indices(sentence, vocab_dict):
+    words = tokenize_sentence(sentence)
     vocab_indices = [(vocab_dict[w] if w in vocab_dict else vocab_dict[UNK_IDENTIFIER])
         for w in words]
     return vocab_indices

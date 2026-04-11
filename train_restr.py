@@ -2,6 +2,8 @@
 import os
 import os.path as osp
 import argparse
+import json
+from pathlib import Path
 from eval.evaluate import evaluate
 
 import torch
@@ -19,9 +21,13 @@ from dataset.referit_dataset_vit import ReferDataSet_vit
 from model.factory import create_restr
 from utils.loss import AverageMeter, adjust_learning_rate
 from utils.torchutils import Patch_label_gen, set_seed
+from utils.text_assets import get_dataset_text_spec
 
 import timeit
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 start = timeit.default_timer()
 
@@ -42,6 +48,30 @@ WEIGHT_DECAY = 0.0005
 EXPERIMENT_NAME = 'restr'
 LOG_EVERY = 100
 
+
+def infer_dataset_name(data_dir):
+    return Path(data_dir).name.split("_")[0]
+
+
+def infer_data_root(data_dir):
+    return str(Path(data_dir).resolve().parent.parent)
+
+
+def resolve_text_len(dataset_name, override=None):
+    if override is not None:
+        return override
+    return get_dataset_text_spec(dataset_name)["text_len"]
+
+
+def create_wandb_run(args, dataset_name):
+    if not args.enable_wandb:
+        return None
+    if wandb is None:
+        raise ImportError("wandb is not installed, but --enable_wandb was requested.")
+
+    wandb_proj_name = args.wandb_proj + "_" + dataset_name
+    return wandb.init(project=wandb_proj_name, name=args.exp_name, config=args, entity="")
+
 def get_arguments():
     """Parse all the arguments provided from the CLI.
     
@@ -59,6 +89,7 @@ def get_arguments():
     parser.add_argument("--valset", type=str, default=VALSET)
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--input_size", type=str, default=INPUT_SIZE)
+    parser.add_argument("--text_len", type=int, default=None)
 
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
     parser.add_argument("--end_lr", type=float, default=END_LEARNING_RATE)
@@ -83,6 +114,7 @@ def get_arguments():
     parser.add_argument("--save_every", type=int, default=SAVE_PRED_EVERY)
     parser.add_argument("--log_every", type=int, default=LOG_EVERY)
     parser.add_argument("--wandb_proj", type=str, default="RefImgSeg")
+    parser.add_argument("--enable_wandb", action="store_true")
 
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--amp", action="store_true")
@@ -95,21 +127,22 @@ set_seed(args.seed)
 def make_model_cfg(args, cfg, input_size, dataset_name):
     model_cfg = {}
     v_backbone = args.v_backbone
-    v_model_cfg = cfg["v_backbone"][v_backbone]
+    v_model_cfg = cfg["v_backbone"][v_backbone].copy()
     v_model_cfg["image_size"] = input_size
     v_model_cfg["backbone"] = v_backbone
     model_cfg["v_backbone"] = v_model_cfg
     
     l_backbone = args.l_backbone
-    l_model_cfg = cfg["l_backbone"][l_backbone]
-    # l_model_cfg["backbone"] = l_backbone
+    l_model_cfg = cfg["l_backbone"][l_backbone].copy()
     l_model_cfg["n_heads"] = v_model_cfg["n_heads"]
     l_model_cfg["emb_name"] = dataset_name
     l_model_cfg["d_model"] = v_model_cfg["d_model"]
+    l_model_cfg["data_root"] = infer_data_root(args.data_dir)
+    l_model_cfg["text_len"] = resolve_text_len(dataset_name, args.text_len)
     model_cfg["l_backbone"] = l_model_cfg
 
     fusion_module = args.mm_fusion
-    mm_fusion_cfg = cfg["fusion_module"]
+    mm_fusion_cfg = cfg["fusion_module"].copy()
     mm_fusion_cfg["name"] = fusion_module
     mm_fusion_cfg["is_shared"] =args.is_shared
     mm_fusion_cfg["is_decoder"] = not args.no_decoder
@@ -122,12 +155,10 @@ def make_model_cfg(args, cfg, input_size, dataset_name):
 def main():
     """Create the model and start the training."""
     
-    dataset_name = ((args.data_dir).split("/")[-1]).split("_")[0]
+    dataset_name = infer_dataset_name(args.data_dir)
     print("Training dataset: {} | In {} of threads".format(dataset_name, torch.get_num_threads()))
     print("<Argument check>\n", vars(args))
-
-    wandb_proj_name = args.wandb_proj + "_" + dataset_name
-    wandb.init(project=wandb_proj_name, name=args.exp_name, config=args, entity='')
+    wandb_run = create_wandb_run(args, dataset_name)
 
     h, w = map(int, args.input_size.split(',')) 
     input_size = (h, w)
@@ -155,6 +186,8 @@ def main():
         os.makedirs(snapshot_dir)
     if not os.path.exists(eval_dir):
         os.makedirs(eval_dir)
+    best_ckpt_path = osp.join(snapshot_dir, "best_iou.pth")
+    best_metrics_path = osp.join(snapshot_dir, "best_iou_metrics.json")
 
     ## Call dataloader {Gref, unc, unc+, referit}
     trainloader = data.DataLoader(ReferDataSet_vit(args.data_dir, args.set, max_iters=args.num_steps * args.batch_size), 
@@ -179,6 +212,7 @@ def main():
     
     ### START Training
     best_IoU = 0.0
+    best_metrics = None
     losses = dict()
     losses['pixel'] = AverageMeter()
     losses['patch'] = AverageMeter()
@@ -225,11 +259,12 @@ def main():
         # Logger
         if i_iter % args.log_every == 0:
             print('iter = {0:7d}/{1:7d}, loss_pixel={2:.5f}, batch_size:{3:}'.format(i_iter, args.num_steps, losses['pixel'].avg, args.batch_size))
-            wandb.log({
-            "Loss_avg@pixel": losses['pixel'].avg,
-            "Loss_avg@patch": losses['patch'].avg,
-            "lr": lr,
-            }, step=i_iter)
+            if wandb_run is not None:
+                wandb.log({
+                "Loss_avg@pixel": losses['pixel'].avg,
+                "Loss_avg@patch": losses['patch'].avg,
+                "lr": lr,
+                }, step=i_iter)
             losses['pixel'].reset()
             losses['patch'].reset()
 
@@ -237,22 +272,29 @@ def main():
         if (i_iter == 1) or (i_iter % args.save_every == 0):
             model.eval()
             output_eval_dir = os.path.join(eval_dir, str(i_iter))
-            cum_IoU = evaluate(output_eval_dir, i_iter, model, valloader=valloader, H=input_size[0], W=input_size[1]
+            metrics = evaluate(output_eval_dir, i_iter, model, valloader=valloader, H=input_size[0], W=input_size[1]
                 , is_vis=args.is_vis, save_im_sent = True)
+            current_iou = metrics["IoU"]
                 
             print('taking snapshot ...')
-            if i_iter !=1:
-                wandb.log({"cum_IoU_val": cum_IoU}, step=i_iter)
-            if i_iter == 0:
-                best_IoU = 0
-            if cum_IoU > best_IoU:
-                best_IoU = cum_IoU 
+            if i_iter != 1 and wandb_run is not None:
+                wandb.log({f"val/{key}": value for key, value in metrics.items()}, step=i_iter)
+            if current_iou > best_IoU:
+                best_IoU = current_iou
+                best_metrics = {"iteration": i_iter, "dataset": dataset_name, "metrics": metrics}
+                torch.save(model.state_dict(), best_ckpt_path)
+                with open(best_metrics_path, "w", encoding="utf-8") as handle:
+                    json.dump(best_metrics, handle, indent=2)
                 torch.save(model.state_dict(),osp.join(snapshot_dir, dataset_name + "_" + str(i_iter) + '.pth')) if i_iter > 10000 else None  
             elif i_iter > args.num_steps * 0.9:
                 torch.save(model.state_dict(),osp.join(snapshot_dir, dataset_name + "_" + str(i_iter) + '.pth')) if i_iter > 10000 else None 
 
     end = timeit.default_timer()
     print(end-start,'seconds')
+    if best_metrics is not None:
+        print("Best val IoU: {:.4f} at iter {}".format(best_metrics["metrics"]["IoU"], best_metrics["iteration"]))
+    if wandb_run is not None:
+        wandb.finish()
 
 if __name__ == '__main__':
     main()

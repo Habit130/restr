@@ -11,6 +11,7 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from timm.models.layers import trunc_normal_
 from model.transformers.utils import init_weights, positionalencoding1d, positionalencoding2d
 from model.transformers.blocks import LangBlock
+from utils.text_assets import get_dataset_text_spec
 affine_par = True     
 
 class TR_GloVe(nn.Module):
@@ -24,20 +25,25 @@ class TR_GloVe(nn.Module):
         n_heads,
         dropout=0.0,
         drop_path_rate=0.1,
-        data_root='data', 
+        data_root='data',
+        text_len=20,
         ):
         super().__init__()
         
         self.d_model = d_model
-        # GloVe embedding
-        glove_np = np.load(osp.join(data_root,'referit_emb.npy')) if emb_name == 'referit' else np.load(osp.join(data_root,'Gref_emb.npy'))
-        print("Loaded embedding npy at data/{}_emb.npy".format('referit' if emb_name == 'referit' else 'Gref'))
+        text_spec = get_dataset_text_spec(emb_name, data_root=data_root)
+        glove_np = np.load(text_spec["embedding_path"])
+        print(f"Loaded embedding npy at {text_spec['embedding_path']}")
         self.glove = torch.from_numpy(glove_np)  # [vocab_size, 300]
         self.embedding = nn.Embedding.from_pretrained(self.glove, padding_idx=0, freeze=False)
         self.embedding.weight[0].data.zero_()
 
         # Positional embedding for TR
-        self.pos_emb_l = positionalencoding1d(d_lang, 20).unsqueeze(0).cuda()
+        self.register_buffer(
+            "pos_emb_l",
+            positionalencoding1d(d_lang, text_len).unsqueeze(0),
+            persistent=False,
+        )
 
         # TR
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, n_layers)]
@@ -54,7 +60,7 @@ class TR_GloVe(nn.Module):
     def forward(self, x):
         x = self.embedding(x) # y.shape = [B, C, 1, 1]
 
-        pos_emb_l = self.pos_emb_l
+        pos_emb_l = self.pos_emb_l.to(x.device)
         x += pos_emb_l
         for blk in self.blocks:
             x = blk(x)
