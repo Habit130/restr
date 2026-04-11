@@ -37,7 +37,6 @@ class MM_fusion(nn.Module):
         self.d_v_encoder = d_v_encoder
         self.d_l_encoder = d_l_encoder
         self.patch_size = patch_size
-        self.n_l = 20
         self.d_model = d_model
         self.d_ff = d_ff
         self.scale = d_model ** -0.5
@@ -87,6 +86,7 @@ class MM_fusion(nn.Module):
     def forward(self, x_v, x_l, is_distilled, im_size, lang=None):
         H, W = im_size
         GS = H // self.patch_size
+        lang_len = x_l.size(1)
 
         # Remove CLS/DIST tokens for decoding
         num_extra_tokens = 1 + is_distilled
@@ -108,7 +108,7 @@ class MM_fusion(nn.Module):
         for _ in range(self.num_shared):
             for blk in self.blocks_vl:
                 x = blk(x)
-        patches, x_l = x[:, :-self.n_l], x[:, -self.n_l:]
+        patches, x_l = x[:, :-lang_len], x[:, -lang_len:]
     
         x = torch.cat((x_l, seed_emb), 1)
         for _ in range(self.num_shared):
