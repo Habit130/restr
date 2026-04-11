@@ -42,8 +42,8 @@ END_LEARNING_RATE = 0
 MOMENTUM = 0.9
 POWER = 0.9
 
-NUM_STEPS = 400000
-SAVE_PRED_EVERY = 5000
+EPOCHS = 50
+SAVE_EVERY_EPOCHS = 1
 WEIGHT_DECAY = 0.0005
 EXPERIMENT_NAME = 'restr'
 LOG_EVERY = 100
@@ -93,8 +93,8 @@ def get_arguments():
 
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
     parser.add_argument("--end_lr", type=float, default=END_LEARNING_RATE)
-    parser.add_argument("--num_steps", type=int, default=NUM_STEPS)
-    parser.add_argument("--warm_iter", type=int, default=NUM_STEPS // 10)
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--warm_iter", type=int, default=None)
     parser.add_argument("--adamW", action="store_true")
     parser.add_argument("--grad_clip", type=float, default=0)
     parser.add_argument("--momentum", type=float, default=MOMENTUM)
@@ -111,7 +111,7 @@ def get_arguments():
 
     parser.add_argument("--is_vis", action="store_true")
     parser.add_argument("--exp_name", type=str, default=EXPERIMENT_NAME)
-    parser.add_argument("--save_every", type=int, default=SAVE_PRED_EVERY)
+    parser.add_argument("--save_every_epochs", type=int, default=SAVE_EVERY_EPOCHS)
     parser.add_argument("--log_every", type=int, default=LOG_EVERY)
     parser.add_argument("--wandb_proj", type=str, default="RefImgSeg")
     parser.add_argument("--enable_wandb", action="store_true")
@@ -189,14 +189,22 @@ def main():
     best_ckpt_path = osp.join(snapshot_dir, "best_iou.pth")
     best_metrics_path = osp.join(snapshot_dir, "best_iou_metrics.json")
 
-    ## Call dataloader {Gref, unc, unc+, referit}
-    trainloader = data.DataLoader(ReferDataSet_vit(args.data_dir, args.set, max_iters=args.num_steps * args.batch_size), 
-                    batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
-    trainloader_iter = enumerate(trainloader)
+    ## Call dataloader {Gref, unc, unc+, referit, plantseg}
+    trainloader = data.DataLoader(
+        ReferDataSet_vit(args.data_dir, args.set),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=8,
+        pin_memory=True,
+    )
 
     val_max_iters = 10000 if dataset_name == 'referit' else None
     valloader = data.DataLoader(ReferDataSet_vit(args.data_dir, args.valset, max_iters=val_max_iters), 
                             batch_size=1, shuffle=False, num_workers=1)
+
+    steps_per_epoch = len(trainloader)
+    total_steps = args.epochs * steps_per_epoch
+    warm_iter = args.warm_iter if args.warm_iter is not None else max(1, total_steps // 10)
 
     ## Define Optimizer 
     optimizer = optim.AdamW(model.optim_parameters(args)
@@ -213,86 +221,122 @@ def main():
     ### START Training
     best_IoU = 0.0
     best_metrics = None
+    global_step = 0
     losses = dict()
     losses['pixel'] = AverageMeter()
     losses['patch'] = AverageMeter()
-    for i_iter in range(1, args.num_steps+1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
-        
-        lr = adjust_learning_rate(optimizer, i_iter-1, args.lr, args.end_lr, args.num_steps, args.power, args.warm_iter, args.is_cos)
-        
-        # Load dataset
-        _, batch = next(trainloader_iter)
-        images, labels, size, texts, sents, name = batch
-        images = Variable(images).cuda()
-        labels = Variable(labels.float()).cuda()
-        p_labels = patch_label_gen(labels)
-        p_labels = Variable(p_labels.float()).cuda()
-        texts =Variable(texts).cuda()
-        
-        # Extract visual feature
-        with torch.cuda.amp.autocast(enabled=args.amp):
-            pixel_pred, _, patch_pred = model(images, texts)
-            pixel_pred = interp_pred(pixel_pred)
-            labels = interp_label(labels)
+        for batch in trainloader:
+            global_step += 1
+            lr = adjust_learning_rate(
+                optimizer,
+                global_step - 1,
+                args.lr,
+                args.end_lr,
+                total_steps,
+                args.power,
+                warm_iter,
+                args.is_cos,
+            )
 
-            # Loss for localization
-            bce_loss_patch = torch.nn.BCEWithLogitsLoss()
-            loss_patch = bce_loss_patch(patch_pred, p_labels)
-            
-            # Loss for segmentation
-            bce_loss_pixel = torch.nn.BCEWithLogitsLoss()
-            loss_pixel = bce_loss_pixel(pixel_pred, labels)
+            images, labels, size, texts, sents, name = batch
+            images = Variable(images).cuda()
+            labels = Variable(labels.float()).cuda()
+            p_labels = patch_label_gen(labels)
+            p_labels = Variable(p_labels.float()).cuda()
+            texts = Variable(texts).cuda()
 
-            loss = loss_pixel + args.alpha_loc * loss_patch
-        
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        if args.grad_clip > 0:
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        losses['pixel'].update(loss_pixel)
-        losses['patch'].update(loss_patch)
+            with torch.cuda.amp.autocast(enabled=args.amp):
+                pixel_pred, _, patch_pred = model(images, texts)
+                pixel_pred = interp_pred(pixel_pred)
+                labels = interp_label(labels)
 
-        # Logger
-        if i_iter % args.log_every == 0:
-            print('iter = {0:7d}/{1:7d}, loss_pixel={2:.5f}, batch_size:{3:}'.format(i_iter, args.num_steps, losses['pixel'].avg, args.batch_size))
+                bce_loss_patch = torch.nn.BCEWithLogitsLoss()
+                loss_patch = bce_loss_patch(patch_pred, p_labels)
+
+                bce_loss_pixel = torch.nn.BCEWithLogitsLoss()
+                loss_pixel = bce_loss_pixel(pixel_pred, labels)
+
+                loss = loss_pixel + args.alpha_loc * loss_patch
+
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            losses['pixel'].update(loss_pixel.item())
+            losses['patch'].update(loss_patch.item())
+
+            if global_step % args.log_every == 0:
+                print(
+                    'epoch = {0:3d}/{1:3d}, iter = {2:5d}/{3:5d}, loss_pixel={4:.5f}, batch_size:{5:}'.format(
+                        epoch,
+                        args.epochs,
+                        global_step,
+                        total_steps,
+                        losses['pixel'].avg,
+                        args.batch_size,
+                    )
+                )
+                if wandb_run is not None:
+                    wandb.log({
+                    "train/Loss_avg@pixel": losses['pixel'].avg,
+                    "train/Loss_avg@patch": losses['patch'].avg,
+                    "train/lr": lr,
+                    "train/epoch": epoch,
+                    }, step=global_step)
+                losses['pixel'].reset()
+                losses['patch'].reset()
+
+        if epoch == 1 or (epoch % args.save_every_epochs == 0):
+            model.eval()
+            output_eval_dir = os.path.join(eval_dir, f"epoch_{epoch}")
+            metrics = evaluate(
+                output_eval_dir,
+                global_step,
+                model,
+                valloader=valloader,
+                H=input_size[0],
+                W=input_size[1],
+                is_vis=args.is_vis,
+                save_im_sent=True,
+            )
+            current_iou = metrics["IoU"]
+
+            print('taking snapshot ...')
             if wandb_run is not None:
                 wandb.log({
-                "Loss_avg@pixel": losses['pixel'].avg,
-                "Loss_avg@patch": losses['patch'].avg,
-                "lr": lr,
-                }, step=i_iter)
-            losses['pixel'].reset()
-            losses['patch'].reset()
-
-        #Snapshot
-        if (i_iter == 1) or (i_iter % args.save_every == 0):
-            model.eval()
-            output_eval_dir = os.path.join(eval_dir, str(i_iter))
-            metrics = evaluate(output_eval_dir, i_iter, model, valloader=valloader, H=input_size[0], W=input_size[1]
-                , is_vis=args.is_vis, save_im_sent = True)
-            current_iou = metrics["IoU"]
-                
-            print('taking snapshot ...')
-            if i_iter != 1 and wandb_run is not None:
-                wandb.log({f"val/{key}": value for key, value in metrics.items()}, step=i_iter)
+                    **{f"val/{key}": value for key, value in metrics.items()},
+                    "val/epoch": epoch,
+                }, step=global_step)
             if current_iou > best_IoU:
                 best_IoU = current_iou
-                best_metrics = {"iteration": i_iter, "dataset": dataset_name, "metrics": metrics}
+                best_metrics = {
+                    "epoch": epoch,
+                    "iteration": global_step,
+                    "dataset": dataset_name,
+                    "metrics": metrics,
+                }
                 torch.save(model.state_dict(), best_ckpt_path)
                 with open(best_metrics_path, "w", encoding="utf-8") as handle:
                     json.dump(best_metrics, handle, indent=2)
-                torch.save(model.state_dict(),osp.join(snapshot_dir, dataset_name + "_" + str(i_iter) + '.pth')) if i_iter > 10000 else None  
-            elif i_iter > args.num_steps * 0.9:
-                torch.save(model.state_dict(),osp.join(snapshot_dir, dataset_name + "_" + str(i_iter) + '.pth')) if i_iter > 10000 else None 
+
+            if epoch > int(args.epochs * 0.9):
+                torch.save(model.state_dict(), osp.join(snapshot_dir, f"{dataset_name}_epoch_{epoch}.pth"))
 
     end = timeit.default_timer()
     print(end-start,'seconds')
     if best_metrics is not None:
-        print("Best val IoU: {:.4f} at iter {}".format(best_metrics["metrics"]["IoU"], best_metrics["iteration"]))
+        print(
+            "Best val IoU: {:.4f} at epoch {} (iter {})".format(
+                best_metrics["metrics"]["IoU"],
+                best_metrics["epoch"],
+                best_metrics["iteration"],
+            )
+        )
     if wandb_run is not None:
         wandb.finish()
 

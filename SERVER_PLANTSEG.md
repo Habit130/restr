@@ -50,6 +50,7 @@ python build_batches.py -d plantseg -t test --img-size 480
 ## 训练
 
 默认关闭 W&B；需要时显式加 `--enable_wandb`。
+默认训练预算是 `50 epochs`，用于和其它同数据集基线保持一致。
 
 ```bash
 python train_restr.py \
@@ -65,7 +66,7 @@ python train_restr.py \
 
 - `best_iou.pth`
 - `best_iou_metrics.json`
-- 兼容旧流程的迭代 checkpoint
+- 后 10% epoch 的兼容 checkpoint
 
 ## 正式评估
 
