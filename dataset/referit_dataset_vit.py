@@ -50,14 +50,19 @@ class ReferDataSet_vit(data.Dataset):
 
         datafiles = np.load(self.data_list[index])
 
-        name = self.data_list[index].split('/')[-1]
-        name = name.split('.')[0]
+        default_name = osp.splitext(osp.basename(self.data_list[index]))[0]
 
         # pdb.set_trace()
         image = Image.fromarray(datafiles["im_batch"]).convert('RGB')
         label = datafiles["mask_batch"]
         text = datafiles["text_batch"]
         sent = datafiles["sent_batch"]
+        raw_name = datafiles["im_name_batch"] if "im_name_batch" in datafiles.files else default_name
+        if isinstance(raw_name, np.ndarray):
+            raw_name = raw_name.tolist()
+            if isinstance(raw_name, list):
+                raw_name = raw_name[0]
+        name = str(raw_name)
 
         # image = np.array(image, dtype=np.uint8)
         # augmented = self.aug(image, label, w=self.resize[0], h=self.resize[1])

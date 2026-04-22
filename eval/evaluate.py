@@ -52,6 +52,26 @@ def resolve_text_len(dataset_name, override=None):
     return get_dataset_text_spec(dataset_name)["text_len"]
 
 
+def ensure_legacy_eval_dirs(output_eval_dir):
+    os.makedirs(output_eval_dir, exist_ok=True)
+    for subdir in ("img", "gt", "pred_sigm", "pred_h", "pred_cmap"):
+        os.makedirs(os.path.join(output_eval_dir, subdir), exist_ok=True)
+
+
+def resolve_mask_relative_path(dataset_name, sample_name):
+    stem = Path(str(sample_name)).stem
+    if dataset_name == "plantseg":
+        return Path("ann") / f"{stem}.png"
+    return Path(f"{stem}.png")
+
+
+def save_binary_mask_file(mask_tensor, output_path):
+    mask_array = mask_tensor.detach().cpu().numpy()
+    out_image = Image.fromarray(np.uint8(mask_array * 255), "L")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out_image.save(output_path)
+
+
 def update_confusion_counts(pred_mask, target_mask):
     pred_mask = pred_mask.bool()
     target_mask = target_mask.bool()
@@ -83,13 +103,16 @@ def summarize_binary_metrics(tp, fp, fn, tn):
 
 def evaluate(output_eval_dir, i_iter, model
             , H = 320, W =320, valloader=None, is_vis = False, save_im_sent = False
-            , threshold=THRESHOLD, is_prec=False, dataname = None):
-    if not os.path.exists(output_eval_dir):
-        os.makedirs(output_eval_dir+'/img')
-        os.makedirs(output_eval_dir+'/gt')
-        os.makedirs(output_eval_dir+'/pred_sigm')
-        os.makedirs(output_eval_dir+'/pred_h')
-        os.makedirs(output_eval_dir+'/pred_cmap')
+            , threshold=THRESHOLD, is_prec=False, dataname = None, mask_output_dir=None,
+            save_masks_only=False):
+    os.makedirs(output_eval_dir, exist_ok=True)
+    if is_vis or save_im_sent:
+        ensure_legacy_eval_dirs(output_eval_dir)
+
+    mask_output_root = None
+    if mask_output_dir is not None:
+        mask_output_root = Path(mask_output_dir)
+        mask_output_root.mkdir(parents=True, exist_ok=True)
 
 
     model.eval()
@@ -129,17 +152,24 @@ def evaluate(output_eval_dir, i_iter, model
             orig_images = decode_image_vit(orig_images[0], normalization=STATS['vit'])
 
             hard_pred = (sigm_pred >= threshold) if 0.0 <= threshold <= 1.0 else (pred >= threshold)
-            batch_tp, batch_fp, batch_fn, batch_tn = update_confusion_counts(hard_pred, labels)
-            tp_sum += batch_tp
-            fp_sum += batch_fp
-            fn_sum += batch_fn
-            tn_sum += batch_tn
-            batch_iou = safe_ratio(batch_tp, batch_tp + batch_fp + batch_fn)
-            if is_prec is True:
-                for n_eval_iou in range(len(eval_seg_iou_list)):
-                    eval_seg_iou = eval_seg_iou_list[n_eval_iou]
-                    seg_correct[n_eval_iou] += (batch_iou >= eval_seg_iou)
-                seg_total += 1
+            if not save_masks_only:
+                batch_tp, batch_fp, batch_fn, batch_tn = update_confusion_counts(hard_pred, labels)
+                tp_sum += batch_tp
+                fp_sum += batch_fp
+                fn_sum += batch_fn
+                tn_sum += batch_tn
+                batch_iou = safe_ratio(batch_tp, batch_tp + batch_fp + batch_fn)
+                if is_prec is True:
+                    for n_eval_iou in range(len(eval_seg_iou_list)):
+                        eval_seg_iou = eval_seg_iou_list[n_eval_iou]
+                        seg_correct[n_eval_iou] += (batch_iou >= eval_seg_iou)
+                    seg_total += 1
+
+            if mask_output_root is not None:
+                for i in range(B):
+                    hard_output = hard_pred[i].permute(1,2,0).squeeze()
+                    relative_path = resolve_mask_relative_path(dataname, name[i])
+                    save_binary_mask_file(hard_output, mask_output_root / relative_path)
 
             if is_vis and index < 400:
                 for i in range(B):
@@ -151,18 +181,22 @@ def evaluate(output_eval_dir, i_iter, model
                         save_mask_softpatch_torch(sigm_l_output, name[i], output_eval_dir)
 
                     hard_output = hard_pred[i].permute(1,2,0).squeeze()
-                    save_mask_torch(hard_output, name[i], output_eval_dir)
+                    save_mask_torch(hard_output, Path(str(name[i])).stem, output_eval_dir)
 
                     if save_im_sent:
                         sent = "_".join(sents[i].split(" ")).replace("/", "_")
-                        save_img_gt(orig_images, labels[i].cpu().data.numpy().squeeze(), name[i], sent, output_eval_dir)
+                        save_img_gt(orig_images, labels[i].cpu().data.numpy().squeeze(), Path(str(name[i])).stem, sent, output_eval_dir)
 
-            running_metrics = summarize_binary_metrics(tp_sum, fp_sum, fn_sum, tn_sum)
-            t.set_postfix({"IoU ": " %.3f%% " % running_metrics["IoU"]})  
+            if not save_masks_only:
+                running_metrics = summarize_binary_metrics(tp_sum, fp_sum, fn_sum, tn_sum)
+                t.set_postfix({"IoU ": " %.3f%% " % running_metrics["IoU"]})  
             
             if i_iter == 1:
                 t.close()
                 break
+
+        if save_masks_only:
+            return None
 
         if is_prec is True:
             result_str = ''
@@ -198,6 +232,8 @@ def get_arguments():
     parser.add_argument('--iters', type=int, nargs='*', default=None)
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--text_len", type=int, default=None)
+    parser.add_argument("--mask_output_dir", type=str, default=None)
+    parser.add_argument("--save_masks_only", action="store_true")
 
     parser.add_argument("--v_backbone", type=str, default="vit_base_patch16_384")
     parser.add_argument("--l_backbone", type=str, default="transformer_glove")
@@ -300,11 +336,14 @@ def main():
 
         output_eval_dir = str(output_root / str(i_iter))
         metrics = evaluate(output_eval_dir, i_iter, model, valloader=valloader, H=input_size[0], W=input_size[1]
-            , is_vis=args.is_vis, save_im_sent = True, threshold=args.threshold, is_prec=True, dataname = dataset_name)
-        summary[str(i_iter)] = {"checkpoint": checkpoint_path, "metrics": metrics}
+            , is_vis=args.is_vis, save_im_sent = True, threshold=args.threshold, is_prec=True, dataname = dataset_name,
+            mask_output_dir=args.mask_output_dir, save_masks_only=args.save_masks_only)
+        if metrics is not None:
+            summary[str(i_iter)] = {"checkpoint": checkpoint_path, "metrics": metrics}
 
-    with open(output_root / "summary_metrics.json", "w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
+    if summary:
+        with open(output_root / "summary_metrics.json", "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2)
 
 
 if __name__ == '__main__':
